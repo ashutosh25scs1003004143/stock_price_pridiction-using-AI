@@ -9,6 +9,13 @@ from indicators import add_all_indicators
 from prediction import prepare_ml_data, train_and_evaluate_model, predict_future
 from comparison import compare_stocks
 
+from stock_data import get_stock_categories
+
+# Inside your sidebar or search section:
+categories = get_stock_categories()
+selected_sector = st.sidebar.selectbox("Select Sector", list(categories.keys()))
+selected_company = st.sidebar.selectbox("Select Company", list(categories[selected_sector].keys()))
+symbol = categories[selected_sector][selected_company]
 # Page Configuration
 st.set_page_config(
     page_title="AI Stock Predictor | Professional Financial Dashboard",

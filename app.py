@@ -10,6 +10,7 @@ from prediction import prepare_ml_data, train_and_evaluate_model, predict_future
 from comparison import compare_stocks
 
 from stock_data import get_stock_categories
+from analysis_helper import generate_ai_analysis
 
 # Inside your sidebar or search section:
 categories = get_stock_categories()
@@ -60,6 +61,16 @@ st.markdown("""
     .metric-negative {
         color: #da3633;
         font-weight: 600;
+    }
+    
+    /* AI Insight Card Styling */
+    .ai-insight-card {
+        background-color: #161b22;
+        border: 1px solid #30363d;
+        border-radius: 10px;
+        padding: 20px;
+        margin-bottom: 20px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
     }
     
     /* Headers */

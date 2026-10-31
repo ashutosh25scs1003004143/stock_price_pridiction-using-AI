@@ -1,683 +1,800 @@
-import streamlit as st
+"""
+StockPulse AI - Understand Markets. Invest Smarter.
+Single-file Streamlit app for Indian (NSE/BSE) market intelligence.
+
+Run:    streamlit run app.py
+Secrets (Streamlit Cloud -> App settings -> Secrets, or environment variables):
+    GEMINI_API_KEY      Google Gemini key (AI Analyst)
+    GEMINI_MODEL        optional, default gemini-2.0-flash
+    MARKET_PROVIDER_KEY key of a LICENSED NSE/BSE data vendor (implement LiveProvider below)
+    DB_PATH             optional SQLite path, default stockpulse.db
+
+With no MARKET_PROVIDER_KEY the app runs in clearly labelled DEMO MODE using FICTIONAL data.
+Educational use only. Not investment advice.
+"""
+import datetime as dt
+import hashlib
+import hmac
+import json
+import math
+import os
+import re
+import secrets
+import sqlite3
+from abc import ABC, abstractmethod
+
 import pandas as pd
 import plotly.graph_objects as go
-from datetime import datetime
+import requests
+import streamlit as st
+from plotly.subplots import make_subplots
 
-from stock_data import fetch_stock_data, get_stock_info
-from indicators import add_all_indicators
-from prediction import prepare_ml_data, train_and_evaluate_model, predict_future
-from comparison import compare_stocks
-
-
-# ---------------------------------------------------------
-# PAGE CONFIGURATION — must be the first Streamlit command
-# ---------------------------------------------------------
-st.set_page_config(
-    page_title="EquityAI | Stock Intelligence",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-# ---------------------------------------------------------
-# DESIGN SYSTEM
-# ---------------------------------------------------------
-BG = "#080D18"
-PANEL = "#111827"
-PANEL_ALT = "#151F31"
-BORDER = "rgba(148, 163, 184, 0.16)"
-TEXT = "#F1F5F9"
-MUTED = "#94A3B8"
-BLUE = "#60A5FA"
-GREEN = "#34D399"
-RED = "#FB7185"
-PURPLE = "#A78BFA"
-
-st.markdown(
-    """
-    <style>
-    @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@500;600;700;800&display=swap');
-
-    :root { color-scheme: dark; }
-    html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
-    .stApp {
-        background:
-          radial-gradient(ellipse at 15% 0%, rgba(37,99,235,.13), transparent 34%),
-          radial-gradient(ellipse at 90% 10%, rgba(124,58,237,.10), transparent 30%),
-          #080D18;
-        color: #F1F5F9;
-    }
-    [data-testid="stHeader"] { background: rgba(8,13,24,.82); }
-    [data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #101827 0%, #0B1220 100%);
-        border-right: 1px solid rgba(148,163,184,.13);
-    }
-    [data-testid="stSidebar"] > div { padding-top: 1.4rem; }
-    [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p { color: #A8B5C7; }
-    [data-testid="stSidebar"] .stRadio label { padding: 5px 0; }
-    [data-testid="stSidebar"] [role="radiogroup"] label[data-checked="true"] p { color: #93C5FD !important; font-weight: 700; }
-    [data-testid="stSidebar"] [role="radiogroup"] label p { transition: color .15s ease; }
-    h1, h2, h3 { font-family: 'Manrope', sans-serif !important; color: #F8FAFC !important; }
-    h1 { letter-spacing: -1.2px; font-weight: 800 !important; }
-    h2, h3 { letter-spacing: -.4px; }
-    p, label, span { color: inherit; }
-    .block-container { padding-top: 2.0rem; padding-bottom: 3rem; max-width: 1500px; }
-    div[data-testid="stMetric"] {
-        min-height: 150px;
-        display: flex;
-        flex-direction: column;
-        justify-content: center;
-        background: linear-gradient(145deg, #172235, #101827);
-        border: 1px solid rgba(148,163,184,.16);
-        border-radius: 16px;
-        padding: 17px 18px;
-        box-shadow: 0 12px 28px rgba(0,0,0,.14);
-    }
-    [data-testid="stMetricLabel"] { color: #9CAEC4 !important; }
-    [data-testid="stMetricValue"] { color: #F8FAFC !important; font-family: 'Manrope', sans-serif; }
-    [data-testid="stMetricDelta"] { font-weight: 700; }
-    div[data-testid="stPlotlyChart"] {
-        background: #101827;
-        border: 1px solid rgba(148,163,184,.13);
-        border-radius: 17px;
-        padding: 8px 8px 0 8px;
-    }
-    div[data-testid="stDataFrame"], div[data-testid="stTable"] {
-        border: 1px solid rgba(148,163,184,.15);
-        border-radius: 14px;
-        overflow: hidden;
-    }
-    .hero {
-        background: linear-gradient(115deg, rgba(30,64,175,.34), rgba(17,24,39,.94) 54%, rgba(91,33,182,.22));
-        border: 1px solid rgba(96,165,250,.25);
-        border-radius: 22px;
-        padding: 25px 28px;
-        margin: 5px 0 24px 0;
-        box-shadow: 0 18px 45px rgba(0,0,0,.20);
-    }
-    .eyebrow {
-        color: #93C5FD;
-        text-transform: uppercase;
-        letter-spacing: 2px;
-        font-size: 11px;
-        font-weight: 800;
-        margin-bottom: 8px;
-    }
-    .hero-title {
-        font-family: 'Manrope', sans-serif;
-        color: #F8FAFC;
-        font-size: clamp(25px, 3vw, 38px);
-        font-weight: 800;
-        line-height: 1.15;
-        margin: 0 0 9px 0;
-    }
-    .hero-copy { color: #B8C6D9; font-size: 14px; margin: 0; }
-    .section-kicker {
-        color: #93C5FD;
-        font-size: 11px;
-        font-weight: 800;
-        letter-spacing: 1.7px;
-        text-transform: uppercase;
-        margin: 18px 0 6px 0;
-    }
-    .subtle { color: #94A3B8; font-size: 13px; }
-    .info-card {
-        background: linear-gradient(145deg, #172235, #101827);
-        border: 1px solid rgba(148,163,184,.16);
-        border-radius: 16px;
-        padding: 17px 18px;
-        min-height: 116px;
-    }
-    .info-label { color: #9CAEC4; font-size: 12px; margin-bottom: 9px; }
-    .info-value { color: #F8FAFC; font-family: 'Manrope',sans-serif; font-size: 23px; font-weight: 800; }
-    .info-note { color: #9CAEC4; font-size: 12px; margin-top: 5px; }
-    .positive { color: #34D399 !important; }
-    .negative { color: #FB7185 !important; }
-    .tag {
-        display: inline-block; padding: 5px 10px; border-radius: 999px;
-        background: rgba(96,165,250,.12); color: #93C5FD;
-        border: 1px solid rgba(96,165,250,.22); font-size: 11px; font-weight: 700;
-    }
-    .disclaimer {
-        background: rgba(245,158,11,.08);
-        border: 1px solid rgba(245,158,11,.22);
-        border-radius: 12px; padding: 13px 15px;
-        color: #FCDFA0; font-size: 12px; margin-top: 18px;
-    }
-    .stButton > button {
-        border-radius: 10px; border: 1px solid rgba(96,165,250,.35);
-        font-weight: 700; min-height: 42px;
-    }
-    .stButton > button[kind="primary"] {
-        background: linear-gradient(100deg, #2563EB, #4F46E5);
-        color: white; border: none;
-    }
-    .stTextInput input, .stSelectbox div[data-baseweb="select"] > div {
-        background: #111C2D !important; border-color: rgba(148,163,184,.22) !important;
-        border-radius: 10px !important; color: #F8FAFC !important;
-    }
-    hr { border-color: rgba(148,163,184,.14); }
-    footer { visibility: hidden; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+st.set_page_config(page_title="StockPulse AI", page_icon="📈", layout="wide")
 
 
-# ---------------------------------------------------------
-# REUSABLE HELPERS
-# ---------------------------------------------------------
-def page_header(kicker, title, description):
-    st.markdown(
-        f"""
-        <div class="hero">
-            <div class="eyebrow">{kicker}</div>
-            <div class="hero-title">{title}</div>
-            <p class="hero-copy">{description}</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+def cfg(key, default=""):
+    try:
+        if key in st.secrets:
+            return str(st.secrets[key])
+    except Exception:
+        pass
+    return os.environ.get(key, default)
 
 
-def section_title(title, note=None):
-    st.markdown(f'<div class="section-kicker">{title}</div>', unsafe_allow_html=True)
-    if note:
-        st.caption(note)
+GEMINI_KEY, GEMINI_MODEL = cfg("GEMINI_API_KEY"), cfg("GEMINI_MODEL", "gemini-2.0-flash")
+MARKET_KEY, DB_PATH = cfg("MARKET_PROVIDER_KEY"), cfg("DB_PATH", "stockpulse.db")
+START_BALANCE = 100000.0
+
+st.markdown("""<style>
+.stApp{background:#0B0F19;color:#F8FAFC} [data-testid=stSidebar]{background:#111827}
+div[data-testid=stMetric]{background:#151D2B;border:1px solid #263244;border-radius:12px;padding:12px}
+.demo{background:#3b3208;color:#fde68a;padding:6px 12px;border-radius:8px;font-size:13px}
+.small{color:#94A3B8;font-size:12px}
+</style>""", unsafe_allow_html=True)
 
 
-def make_chart_layout(fig, height=420, y_title=None):
-    fig.update_layout(
-        template="plotly_dark",
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(17,24,39,.35)",
-        font=dict(family="DM Sans, sans-serif", color="#CBD5E1", size=12),
-        height=height,
-        margin=dict(l=18, r=18, t=28, b=18),
-        hovermode="x unified",
-        legend=dict(
-            orientation="h", yanchor="bottom", y=1.02,
-            xanchor="left", x=0, bgcolor="rgba(0,0,0,0)"
-        ),
-        xaxis=dict(showgrid=False, zeroline=False, color="#94A3B8"),
-        yaxis=dict(
-            title=y_title, showgrid=True, gridcolor="rgba(148,163,184,.12)",
-            zeroline=False, color="#94A3B8"
-        ),
-    )
+# ============================ formatting ============================
+def inr(n):
+    if n is None or (isinstance(n, float) and math.isnan(n)):
+        return "Data unavailable"
+    ip, dp = f"{abs(n):.2f}".split(".")
+    if len(ip) > 3:
+        ip = re.sub(r"\B(?=(\d{2})+$)", ",", ip[:-3]) + "," + ip[-3:]
+    return ("-" if n < 0 else "") + "₹" + ip + "." + dp
+
+
+def pct(n):
+    return "—" if n is None else f"{n:+.2f}%"
+
+
+def fmt_time(iso):
+    return dt.datetime.fromisoformat(iso).strftime("%d %b %Y, %H:%M:%S UTC") if iso else "—"
+
+
+def now_iso():
+    return dt.datetime.now(dt.timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
+
+
+# ============================ database (SQLite) ============================
+# NOTE: Streamlit Community Cloud's disk is ephemeral. For permanent data, point DB_PATH
+# to a persistent volume or swap these helpers for MongoDB/Postgres/Supabase.
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT, email TEXT UNIQUE, pw TEXT, exchange TEXT DEFAULT 'NSE', created TEXT);
+CREATE TABLE IF NOT EXISTS watchlists(id INTEGER PRIMARY KEY, uid INTEGER, name TEXT);
+CREATE TABLE IF NOT EXISTS watch_items(wid INTEGER, symbol TEXT, UNIQUE(wid, symbol));
+CREATE TABLE IF NOT EXISTS txs(id INTEGER PRIMARY KEY, uid INTEGER, symbol TEXT, exchange TEXT, qty INTEGER, price REAL, type TEXT, date TEXT);
+CREATE TABLE IF NOT EXISTS vacct(uid INTEGER PRIMARY KEY, balance REAL);
+CREATE TABLE IF NOT EXISTS vtrades(id INTEGER PRIMARY KEY, uid INTEGER, symbol TEXT, qty INTEGER, price REAL, type TEXT, ts TEXT);
+CREATE TABLE IF NOT EXISTS alerts(id INTEGER PRIMARY KEY, uid INTEGER, symbol TEXT, cond TEXT, target REAL, active INTEGER DEFAULT 1, triggered TEXT);
+CREATE TABLE IF NOT EXISTS notifs(id INTEGER PRIMARY KEY, uid INTEGER, msg TEXT, ts TEXT);
+CREATE TABLE IF NOT EXISTS aireports(id INTEGER PRIMARY KEY, uid INTEGER, symbol TEXT, analysis TEXT, ts TEXT);
+CREATE INDEX IF NOT EXISTS i_txs ON txs(uid); CREATE INDEX IF NOT EXISTS i_vt ON vtrades(uid); CREATE INDEX IF NOT EXISTS i_al ON alerts(active);
+"""
+
+
+def db():
+    c = sqlite3.connect(DB_PATH, check_same_thread=False)
+    c.row_factory = sqlite3.Row
+    c.executescript(SCHEMA)
+    return c
+
+
+def q(sql, args=(), one=False):
+    c = db()
+    try:
+        rows = c.execute(sql, args).fetchall()
+    finally:
+        c.close()
+    return (rows[0] if rows else None) if one else rows
+
+
+def x(sql, args=()):
+    c = db()
+    try:
+        cur = c.execute(sql, args)
+        c.commit()
+        return cur
+    finally:
+        c.close()
+
+
+# ============================ auth ============================
+def hash_pw(pw, salt=None):
+    salt = salt or secrets.token_hex(16)
+    return salt + "$" + hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), 200_000).hex()
+
+
+def check_pw(pw, stored):
+    salt, _ = stored.split("$")
+    return hmac.compare_digest(hash_pw(pw, salt), stored)
+
+
+def register(name, email, pw):
+    if not name.strip() or not re.match(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) or len(pw) < 8:
+        return None, "Enter a name, a valid email and a password of at least 8 characters."
+    if q("SELECT 1 FROM users WHERE email=?", (email.lower(),), one=True):
+        return None, "Email already registered."
+    uid = x("INSERT INTO users(name,email,pw,created) VALUES(?,?,?,?)", (name.strip(), email.lower(), hash_pw(pw), now_iso())).lastrowid
+    x("INSERT INTO vacct VALUES(?,?)", (uid, START_BALANCE))
+    return uid, None
+
+
+def login(email, pw):
+    u = q("SELECT * FROM users WHERE email=?", (email.lower(),), one=True)
+    return (u["id"], None) if u and check_pw(pw, u["pw"]) else (None, "Invalid email or password.")
+
+
+# ============================ market data layer ============================
+class MarketProvider(ABC):
+    name = ""
+    demo = False
+
+    @abstractmethod
+    def quotes(self): ...
+    @abstractmethod
+    def indices(self): ...
+    @abstractmethod
+    def history(self, symbol, rng): ...
+    @abstractmethod
+    def fundamentals(self, symbol): ...
+
+
+UNIVERSE = [  # FICTIONAL companies, synthetic numbers - NOT real market data
+    ("DEMOBANK", "Demo Bank Ltd (fictional)", "Banking", 1500, 900000), ("DEMOFIN", "Demo Finserve Ltd (fictional)", "Banking", 780, 300000),
+    ("DEMOTECH", "Demo Technologies Ltd (fictional)", "IT", 3400, 1200000), ("DEMOSOFT", "Demo Softworks Ltd (fictional)", "IT", 1650, 650000),
+    ("DEMOMOTO", "Demo Motors Ltd (fictional)", "Automobile", 920, 340000), ("DEMOPHARMA", "Demo Pharma Ltd (fictional)", "Pharma", 1280, 310000),
+    ("DEMOFMCG", "Demo Consumer Ltd (fictional)", "FMCG", 2450, 580000), ("DEMOPOWER", "Demo Power Ltd (fictional)", "Energy", 310, 420000),
+    ("DEMOSTEEL", "Demo Steel Ltd (fictional)", "Metal", 145, 180000), ("DEMOREALTY", "Demo Realty Ltd (fictional)", "Realty", 2100, 90000),
+    ("DEMOOIL", "Demo Petroleum Ltd (fictional)", "Energy", 2900, 1800000), ("DEMOCEMENT", "Demo Cement Ltd (fictional)", "Metal", 10500, 280000),
+]
+RANGES = {"1D": 1, "1W": 7, "1M": 30, "3M": 90, "6M": 180, "1Y": 365, "5Y": 1825}
+
+
+def _h(s):
+    return int.from_bytes(hashlib.md5(s.encode()).digest()[:4], "big")
+
+
+def _noise(seed):  # deterministic -1..1
+    m = 0xFFFFFFFF
+    t = (seed + 0x6D2B79F5) & m
+    t = ((t ^ (t >> 15)) * (t | 1)) & m
+    t ^= (t + (((t ^ (t >> 7)) * (t | 61)) & m)) & m
+    return (((t ^ (t >> 14)) & m) / 4294967296) * 2 - 1
+
+
+def _day_close(base, sym, d):
+    return base * (1 + 0.12 * math.sin(d / 25 + _h(sym) % 100) + 0.02 * _noise(d * 7919 + _h(sym)))
+
+
+def _today():
+    return int(dt.datetime.now(dt.timezone.utc).timestamp() // 86400)
+
+
+class DemoProvider(MarketProvider):
+    name, demo = "DEMO (fictional data)", True
+
+    def quotes(self):
+        d, out, t = _today(), [], dt.datetime.now(dt.timezone.utc).timestamp()
+        for sym, name, sector, base, cap in UNIVERSE:
+            prev = _day_close(base, sym, d - 1)
+            price = _day_close(base, sym, d) * (1 + 0.004 * math.sin(t / 60 + _h(sym) % 100))
+            closes = [_day_close(base, sym, d - i) for i in range(0, 252, 3)]
+            out.append(dict(symbol=sym, name=name, exchange="NSE", sector=sector, price=round(price, 2), change=round(price - prev, 2),
+                            changePercent=round((price - prev) / prev * 100, 2), open=round(prev * 1.001, 2), high=round(max(price, prev) * 1.006, 2),
+                            low=round(min(price, prev) * 0.994, 2), prevClose=round(prev, 2), volume=int(500000 + abs(_noise(d + _h(sym))) * 4_000_000),
+                            week52High=round(max(closes), 2), week52Low=round(min(closes), 2), marketCap=cap, asOf=now_iso()))
+        return out
+
+    def indices(self):
+        d, t, out = _today(), dt.datetime.now(dt.timezone.utc).timestamp(), []
+        for sym, name, base in [("NIFTY 50", "NIFTY 50 (demo)", 24500), ("SENSEX", "SENSEX (demo)", 80500), ("BANK NIFTY", "BANK NIFTY (demo)", 52000), ("NIFTY IT", "NIFTY IT (demo)", 38000)]:
+            h = _h(sym) % 100
+            f = lambda i: base * (1 + 0.05 * math.sin(i / 30 + h))
+            prev = f(d - 1)
+            spark = [round(f(d) * (1 + 0.004 * math.sin(i / 5 + h) + 0.0015 * _noise(i * 13 + h + int(t // 3600))), 2) for i in range(40)]
+            out.append(dict(name=name, value=spark[-1], change=round(spark[-1] - prev, 2), changePercent=round((spark[-1] - prev) / prev * 100, 2),
+                            prevClose=round(prev, 2), spark=spark, asOf=now_iso()))
+        return out
+
+    def history(self, symbol, rng):
+        u = next((u for u in UNIVERSE if u[0] == symbol), None)
+        if not u:
+            return pd.DataFrame()
+        sym, base, h, rows = u[0], u[3], _h(u[0]) % 100, []
+        if rng == "1D":
+            start = dt.datetime.now(dt.timezone.utc).replace(hour=3, minute=45, second=0, microsecond=0, tzinfo=None)
+            b = _day_close(base, sym, _today() - 1)
+            for i in range(75):
+                o = b * (1 + 0.004 * math.sin(i / 8 + h) + 0.001 * _noise(i + h)); c = b * (1 + 0.004 * math.sin((i + 1) / 8 + h) + 0.001 * _noise(i + 1 + h))
+                rows.append((start + dt.timedelta(minutes=5 * i), o, max(o, c) * 1.001, min(o, c) * 0.999, c, int(20000 + abs(_noise(i + h)) * 90000)))
+        else:
+            d = _today()
+            for i in range(RANGES[rng], -1, -1):
+                idx = d - i; o, c = _day_close(base, sym, idx - 1), _day_close(base, sym, idx)
+                rows.append((dt.datetime(1970, 1, 1) + dt.timedelta(days=idx), o, max(o, c) * (1 + 0.006 * abs(_noise(idx + h))),
+                             min(o, c) * (1 - 0.006 * abs(_noise(idx * 3 + h))), c, int(500000 + abs(_noise(idx + h)) * 4_000_000)))
+        return pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "volume"]).round(2)
+
+    def fundamentals(self, symbol):
+        if not any(u[0] == symbol for u in UNIVERSE):
+            return None
+        h = _h(symbol) % 1000
+        n = lambda k, lo, hi: round(lo + (_noise(h + k) + 1) / 2 * (hi - lo), 2)
+        return {"P/E": n(1, 12, 38), "P/B": n(2, 1.5, 8), "EPS": n(3, 10, 120), "ROE %": n(4, 8, 28), "ROCE %": n(5, 9, 30), "Debt/Equity": n(6, 0, 1.4),
+                "Revenue growth %": n(7, -3, 22), "Profit growth %": n(8, -8, 30), "Dividend yield %": n(9, 0, 3)}
+
+
+class LiveProvider(MarketProvider):
+    """TEMPLATE: implement with a LICENSED NSE/BSE data vendor using MARKET_KEY. Do NOT scrape exchange websites."""
+    name, demo = "LIVE (configure vendor)", False
+
+    def _no(self):
+        raise NotImplementedError("Implement LiveProvider with your licensed data vendor's API.")
+
+    def quotes(self): self._no()
+    def indices(self): self._no()
+    def history(self, symbol, rng): self._no()
+    def fundamentals(self, symbol): self._no()
+
+
+PROVIDER = LiveProvider() if MARKET_KEY else DemoProvider()
+
+
+@st.cache_data(ttl=3, show_spinner=False)
+def get_quotes():
+    return PROVIDER.quotes()
+
+
+@st.cache_data(ttl=3, show_spinner=False)
+def get_indices():
+    return PROVIDER.indices()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def get_history(symbol, rng):
+    return PROVIDER.history(symbol, rng)
+
+
+def quote_of(symbol):
+    return next((s for s in get_quotes() if s["symbol"] == symbol), None)
+
+
+def market_open():
+    ist = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=5.5)
+    mins = ist.hour * 60 + ist.minute
+    return ist.weekday() < 5 and 9 * 60 + 15 <= mins <= 15 * 60 + 30
+
+
+def safe_market(fn, *a):
+    try:
+        return fn(*a)
+    except Exception as e:
+        st.error(f"Market data unavailable: {e}")
+        return None
+
+
+# ============================ indicators ============================
+def add_indicators(df):
+    c = df["close"]
+    df["sma20"], df["sma50"] = c.rolling(20).mean(), c.rolling(50).mean()
+    sd = c.rolling(20).std(ddof=0)
+    df["bb_up"], df["bb_lo"] = df["sma20"] + 2 * sd, df["sma20"] - 2 * sd
+    d = c.diff()
+    g, l = d.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean(), (-d.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+    df["rsi"] = 100 - 100 / (1 + g / l.replace(0, 1e-9))
+    df["macd"] = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
+    df["signal"] = df["macd"].ewm(span=9, adjust=False).mean()
+    df["hist"] = df["macd"] - df["signal"]
+    return df
+
+
+def stock_chart(df):
+    df = add_indicators(df.copy())
+    fig = make_subplots(rows=4, cols=1, shared_xaxes=True, row_heights=[0.5, 0.12, 0.18, 0.2], vertical_spacing=0.02)
+    fig.add_trace(go.Candlestick(x=df["time"], open=df["open"], high=df["high"], low=df["low"], close=df["close"], name="Price",
+                                 increasing_line_color="#22C55E", decreasing_line_color="#EF4444"), 1, 1)
+    for col, color, nm, dash in [("sma20", "#F59E0B", "SMA20", None), ("sma50", "#A78BFA", "SMA50", None), ("bb_up", "#64748B", "BB upper", "dot"), ("bb_lo", "#64748B", "BB lower", "dot")]:
+        fig.add_trace(go.Scatter(x=df["time"], y=df[col], name=nm, line=dict(color=color, width=1, dash=dash)), 1, 1)
+    fig.add_trace(go.Bar(x=df["time"], y=df["volume"], name="Volume", marker_color="#3B82F6"), 2, 1)
+    fig.add_trace(go.Scatter(x=df["time"], y=df["rsi"], name="RSI(14)", line=dict(color="#3B82F6", width=1)), 3, 1)
+    fig.add_hline(y=70, line_dash="dot", line_color="#64748B", row=3, col=1); fig.add_hline(y=30, line_dash="dot", line_color="#64748B", row=3, col=1)
+    fig.add_trace(go.Bar(x=df["time"], y=df["hist"], name="MACD hist", marker_color=["#22C55E" if v >= 0 else "#EF4444" for v in df["hist"].fillna(0)]), 4, 1)
+    fig.add_trace(go.Scatter(x=df["time"], y=df["macd"], name="MACD", line=dict(color="#3B82F6", width=1)), 4, 1)
+    fig.add_trace(go.Scatter(x=df["time"], y=df["signal"], name="Signal", line=dict(color="#F59E0B", width=1)), 4, 1)
+    fig.update_layout(height=760, template="plotly_dark", paper_bgcolor="#151D2B", plot_bgcolor="#151D2B", xaxis_rangeslider_visible=False,
+                      margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h", y=1.02))
     return fig
 
 
-def show_data_error(message, fallback="Please check the ticker symbol and try again."):
-    st.error(f"{message or 'The data provider did not return usable data.'} {fallback}")
-
-
-def get_valid_stock_data(symbol, period):
-    if not symbol:
-        return None, "Please enter a stock symbol."
-    df, error = fetch_stock_data(symbol, period=period)
-    if error or df is None or df.empty:
-        return None, error or "No historical data was returned."
-    return df.copy(), None
-
-
-def currency_price(info):
-    return f"{info.get('currency', '')} {float(info.get('current_price', 0)):,.2f}"
-
-
-# ---------------------------------------------------------
-# SESSION STATE
-# ---------------------------------------------------------
-if "history" not in st.session_state:
-    st.session_state.history = []
-
-
-# ---------------------------------------------------------
-# SIDEBAR
-# ---------------------------------------------------------
-with st.sidebar:
-    st.markdown(
-        """
-        <div style="padding:4px 0 15px 0;">
-            <div style="font-size:30px;">📈</div>
-            <div style="font-family:Manrope,sans-serif;font-size:20px;font-weight:800;color:#F8FAFC;">
-                Equity<span style="color:#60A5FA;">AI</span>
-            </div>
-            <div style="font-size:11px;color:#8191A8;letter-spacing:1.4px;">STOCK INTELLIGENCE</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.markdown("---")
-    menu = st.radio(
-        "WORKSPACE",
-        [
-            "Dashboard",
-            "Stock Analysis",
-            "AI Stock Prediction",
-            "Stock Comparison",
-            "Market Watchlist",
-            "Prediction History",
-            "About Project",
-        ],
-        label_visibility="visible",
-    )
-    st.markdown("---")
-    st.markdown("**Market shortcuts**")
-    quick_symbol = st.selectbox(
-        "Popular symbols",
-        ["RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "AAPL", "MSFT", "NVDA"],
-        label_visibility="collapsed",
-    )
-    st.caption("Indian NSE symbols use the `.NS` suffix. Example: TCS.NS.")
-    st.markdown("---")
-    st.markdown(
-        '<span class="tag">EDUCATIONAL PROJECT</span>',
-        unsafe_allow_html=True,
-    )
-
-
-# ---------------------------------------------------------
-# 1. DASHBOARD
-# ---------------------------------------------------------
-if menu == "Dashboard":
-    page_header(
-        "MARKET PULSE  /  OVERVIEW",
-        "Your market, in focus.",
-        "Explore historical market movement, key trading metrics and stock performance from one clean workspace.",
-    )
-
-    col1, col2, col3 = st.columns([2.2, 1, 1])
-    with col1:
-        symbol = st.text_input(
-            "Search by ticker",
-            value=quick_symbol,
-            placeholder="e.g. RELIANCE.NS, TCS.NS, AAPL",
-        ).strip().upper()
-    with col2:
-        period_choice = st.selectbox("Chart range", ["1mo", "3mo", "6mo", "1y", "2y", "5y"], index=3)
-    with col3:
-        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
-        refresh = st.button("↻  Refresh data", use_container_width=True)
-
-    if refresh:
-        st.cache_data.clear()
-
-    with st.spinner(f"Loading market data for {symbol}..."):
-        info_data, info_error = get_stock_info(symbol)
-        df, hist_error = get_valid_stock_data(symbol, period_choice)
-
-    if info_error or not info_data or df is None:
-        show_data_error(info_error or hist_error)
-    else:
-        change = float(info_data.get("change", 0) or 0)
-        pct_change = float(info_data.get("pct_change", 0) or 0)
-        sign = "+" if change >= 0 else ""
-
-        section_title("Market snapshot", f"Latest data returned by the connected market-data source for {symbol}.")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Last price", currency_price(info_data), f"{sign}{change:,.2f} ({sign}{pct_change:.2f}%)")
-        c2.metric("Day high", f"{float(info_data.get('high', 0)):,.2f}")
-        c3.metric("Day low", f"{float(info_data.get('low', 0)):,.2f}")
-        c4.metric("Volume", f"{int(info_data.get('volume', 0) or 0):,}")
-
-        st.markdown("")
-        section_title("Price performance", f"{symbol} · {period_choice} historical closing prices")
-        line_color = GREEN if change >= 0 else RED
-        area_fill = "rgba(52,211,153,.08)" if change >= 0 else "rgba(251,113,133,.08)"
-        fig = go.Figure()
-        fig.add_trace(
-            go.Scatter(
-                x=df["Date"], y=df["Close"], name="Closing price",
-                mode="lines", line=dict(color=line_color, width=2.6),
-                fill="tozeroy", fillcolor=area_fill,
-                hovertemplate="%{x|%d %b %Y}<br>Close: %{y:,.2f}<extra></extra>",
-            )
-        )
-        make_chart_layout(fig, 450, f"Price ({info_data.get('currency', '')})")
-        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-
-        left, right = st.columns([1.4, 1])
-        with left:
-            section_title("Latest available data")
-            st.caption(f"Data timestamp: {info_data.get('timestamp', 'Not provided by data source')}")
-        with right:
-            st.markdown(
-                '<div class="disclaimer">Market data may be delayed or subject to provider limitations. '
-                'This dashboard is for educational purposes and is not investment advice.</div>',
-                unsafe_allow_html=True,
-            )
-
-
-# ---------------------------------------------------------
-# 2. TECHNICAL STOCK ANALYSIS
-# ---------------------------------------------------------
-elif menu == "Stock Analysis":
-    page_header(
-        "TECHNICAL RESEARCH",
-        "Understand the trend.",
-        "Study moving averages, momentum and trend strength using the indicators already implemented in your project.",
-    )
-    c1, c2 = st.columns([2, 1])
-    with c1:
-        symbol = st.text_input("Stock ticker", value=quick_symbol).strip().upper()
-    with c2:
-        period = st.selectbox("Analysis period", ["6mo", "1y", "2y", "5y"], index=1)
-
-    with st.spinner("Loading price history and calculating indicators..."):
-        df, error = get_valid_stock_data(symbol, period)
-
-    if error:
-        show_data_error(error)
-    else:
-        try:
-            df = add_all_indicators(df)
-            section_title("Indicator workspace", f"Technical view for {symbol}")
-            tab1, tab2, tab3 = st.tabs(["Moving averages", "RSI momentum", "MACD trend"])
-
-            with tab1:
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=df["Date"], y=df["Close"], name="Close", line=dict(color="#E2E8F0", width=1.8)))
-                if "SMA_20" in df:
-                    fig.add_trace(go.Scatter(x=df["Date"], y=df["SMA_20"], name="20-day SMA", line=dict(color=BLUE, width=2)))
-                if "SMA_50" in df:
-                    fig.add_trace(go.Scatter(x=df["Date"], y=df["SMA_50"], name="50-day SMA", line=dict(color=PURPLE, width=2)))
-                make_chart_layout(fig, 420, "Price")
-                st.plotly_chart(fig, use_container_width=True)
-                st.caption("A moving average smooths price data to help visualize the broader trend.")
-
-            with tab2:
-                if "RSI" not in df:
-                    st.warning("RSI data is not available from the indicator function.")
-                else:
-                    fig = go.Figure()
-                    fig.add_trace(go.Scatter(x=df["Date"], y=df["RSI"], name="RSI", line=dict(color=PURPLE, width=2)))
-                    fig.add_hline(y=70, line_dash="dash", line_color=RED, annotation_text="Upper guide · 70")
-                    fig.add_hline(y=30, line_dash="dash", line_color=GREEN, annotation_text="Lower guide · 30")
-                    make_chart_layout(fig, 360, "RSI")
-                    fig.update_yaxes(range=[0, 100])
-                    st.plotly_chart(fig, use_container_width=True)
-                    st.caption("RSI is a momentum indicator. The 70 and 30 lines are common reference levels, not automatic buy or sell signals.")
-
-            with tab3:
-                needed = {"MACD", "MACD_Signal", "MACD_Hist"}
-                if not needed.issubset(df.columns):
-                    st.warning("MACD columns are not available from the indicator function.")
-                else:
-                    fig = go.Figure()
-                    fig.add_trace(go.Bar(x=df["Date"], y=df["MACD_Hist"], name="Histogram", marker_color="#64748B", opacity=.55))
-                    fig.add_trace(go.Scatter(x=df["Date"], y=df["MACD"], name="MACD", line=dict(color=BLUE, width=2)))
-                    fig.add_trace(go.Scatter(x=df["Date"], y=df["MACD_Signal"], name="Signal", line=dict(color=RED, width=2)))
-                    make_chart_layout(fig, 380, "MACD")
-                    st.plotly_chart(fig, use_container_width=True)
-                    st.caption("MACD compares moving averages to help examine momentum and trend changes.")
-        except Exception as exc:
-            st.error(f"Could not calculate or display the technical indicators: {exc}")
-
-
-# ---------------------------------------------------------
-# 3. AI STOCK PREDICTION
-# ---------------------------------------------------------
-elif menu == "AI Stock Prediction":
-    page_header(
-        "MACHINE LEARNING LAB",
-        "Forecast with your AI model.",
-        "Train the selected model on historical data, review test-set metrics and inspect the next seven predicted sessions.",
-    )
-    c1, c2 = st.columns([2, 1])
-    with c1:
-        symbol = st.text_input("Stock ticker", value="TCS.NS").strip().upper()
-    with c2:
-        model_choice = st.selectbox("Prediction model", ["Random Forest Regressor", "Linear Regression"])
-
-    run_prediction = st.button("⚡  Run AI prediction", type="primary", use_container_width=True)
-
-    if run_prediction:
-        if not symbol:
-            st.warning("Enter a stock ticker before running the model.")
+# ============================ portfolio maths ============================
+def compute_holdings(txs):
+    """Weighted-average-cost method. BUY: avg=(q*avg+bq*p)/(q+bq). SELL: realized=(p-avg)*sq; avg unchanged.
+    Overselling is rejected. Brokerage/taxes and corporate actions (splits/bonus) are NOT automatic - record adjusted transactions."""
+    book = {}
+    for t in sorted(txs, key=lambda t: t["date"]):
+        h = book.setdefault(t["symbol"], dict(symbol=t["symbol"], qty=0, avg=0.0, realized=0.0))
+        if t["type"] == "BUY":
+            tot = h["qty"] * h["avg"] + t["qty"] * t["price"]
+            h["qty"] += t["qty"]; h["avg"] = tot / h["qty"]
         else:
+            if t["qty"] > h["qty"]:
+                raise ValueError(f"Cannot sell {t['qty']} {t['symbol']}; only {h['qty']} held")
+            h["realized"] += (t["price"] - h["avg"]) * t["qty"]; h["qty"] -= t["qty"]
+            if h["qty"] == 0:
+                h["avg"] = 0.0
+    return list(book.values())
+
+
+def bar_alloc(labels, values, title):
+    fig = go.Figure(go.Pie(labels=labels, values=values, hole=0.55))
+    fig.update_layout(title=title, height=300, template="plotly_dark", paper_bgcolor="#151D2B", margin=dict(l=10, r=10, t=40, b=10))
+    return fig
+
+
+# ============================ AI (Gemini) ============================
+SYSTEM = ("You are an educational stock-analysis assistant for Indian markets. Use ONLY the JSON data provided. Never invent figures; if a value is "
+          "missing write 'Data unavailable'. Do not promise returns and do not give personalised buy/sell recommendations. Clearly separate FACTS "
+          "(from data) from INTERPRETATION (your reasoning). Be concise.")
+
+
+def gemini(prompt, history=()):
+    if not GEMINI_KEY:
+        raise RuntimeError("GEMINI_API_KEY is not configured (add it in Streamlit secrets).")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    contents = [{"role": r, "parts": [{"text": t}]} for r, t in history] + [{"role": "user", "parts": [{"text": prompt}]}]
+    r = requests.post(url, headers={"x-goog-api-key": GEMINI_KEY, "Content-Type": "application/json"}, timeout=60,
+                      json={"systemInstruction": {"parts": [{"text": SYSTEM}]}, "contents": contents})
+    if r.status_code != 200:
+        raise RuntimeError(f"AI service error ({r.status_code}).")
+    return "".join(p.get("text", "") for p in r.json()["candidates"][0]["content"]["parts"])
+
+
+def verified_facts(symbol):
+    qt = quote_of(symbol)
+    if not qt:
+        raise RuntimeError("Unknown symbol.")
+    hist = get_history(symbol, "6M")
+    closes = hist["close"]
+    return {"dataSource": PROVIDER.name, "demoData": PROVIDER.demo, "quote": qt, "fundamentals": PROVIDER.fundamentals(symbol),
+            "technical": {"sma20": None if len(closes) < 20 else round(closes.tail(20).mean(), 2), "sma50": None if len(closes) < 50 else round(closes.tail(50).mean(), 2),
+                          "candlesUsed": len(closes)}}
+
+
+# ============================ news / IPO (demo placeholders) ============================
+def get_news():
+    if MARKET_KEY:
+        return []  # plug a licensed news provider here
+    n = now_iso()
+    return [dict(headline="DEMO: Sample headline about the banking sector", summary="Placeholder text shown only in demo mode.", publisher="Demo Source", published=n, url="", category="Banking"),
+            dict(headline="DEMO: Sample headline about technology stocks", summary="Placeholder text shown only in demo mode.", publisher="Demo Source", published=n, url="", category="Technology"),
+            dict(headline="DEMO: Sample headline about the Indian economy", summary="Placeholder text shown only in demo mode.", publisher="Demo Source", published=n, url="", category="Economy")]
+
+
+def get_ipos():
+    if MARKET_KEY:
+        return pd.DataFrame()  # plug a licensed IPO provider here
+    d = lambda n: (dt.date.today() + dt.timedelta(days=n)).isoformat()
+    return pd.DataFrame([
+        dict(Company="Demo Upcoming Ltd (fictional)", Status="Upcoming", Price="₹100–₹105", Lot=140, Opens=d(5), Closes=d(8), Listing=d(13), Subscription="—", ListingPrice="—", Gain="—"),
+        dict(Company="Demo Open Ltd (fictional)", Status="Open", Price="₹250–₹260", Lot=57, Opens=d(-1), Closes=d(2), Listing=d(7), Subscription="2.4x", ListingPrice="—", Gain="—"),
+        dict(Company="Demo Listed Ltd (fictional)", Status="Listed", Price="₹80–₹85", Lot=175, Opens=d(-20), Closes=d(-17), Listing=d(-12), Subscription="35x", ListingPrice="₹98", Gain="+15.3%")])
+
+
+# ============================ alerts ============================
+def evaluate_alerts(uid):
+    quotes = {s["symbol"]: s for s in get_quotes()}
+    for a in q("SELECT * FROM alerts WHERE uid=? AND active=1", (uid,)):
+        s = quotes.get(a["symbol"])
+        if not s:
+            continue
+        hit = ((a["cond"] == "Price above" and s["price"] >= a["target"]) or (a["cond"] == "Price below" and s["price"] <= a["target"])
+               or (a["cond"] == "% increase (day)" and s["changePercent"] >= a["target"]) or (a["cond"] == "% decrease (day)" and s["changePercent"] <= -a["target"]))
+        if hit and x("UPDATE alerts SET active=0, triggered=? WHERE id=? AND active=1", (now_iso(), a["id"])).rowcount:  # fires once
+            msg = f"{a['symbol']} alert ({a['cond']} {a['target']}) triggered at {inr(s['price'])}" + (" [DEMO data]" if PROVIDER.demo else "")
+            x("INSERT INTO notifs(uid,msg,ts) VALUES(?,?,?)", (uid, msg, now_iso()))
+            st.toast(msg, icon="🔔")
+
+
+# ============================ UI helpers ============================
+def banner():
+    if PROVIDER.demo:
+        st.markdown('<div class="demo">⚠ DEMO MODE – all prices, news and IPOs are fictional sample data, not real market prices. '
+                    'Set MARKET_PROVIDER_KEY and implement LiveProvider for real data.</div>', unsafe_allow_html=True)
+
+
+def source_line(asof=None):
+    st.markdown(f'<div class="small">Source: {PROVIDER.name}' + (f" · as of {fmt_time(asof)}" if asof else "") + "</div>", unsafe_allow_html=True)
+
+
+def symbols():
+    return [s["symbol"] for s in get_quotes()]
+
+
+def open_stock(sym):
+    st.session_state.sel = sym
+    st.session_state.page = "Stock Explorer"
+
+
+def quote_table(rows, key):
+    df = pd.DataFrame(rows)[["symbol", "name", "sector", "price", "changePercent", "volume"]]
+    df.columns = ["Symbol", "Company", "Sector", "Price (₹)", "Change %", "Volume"]
+    st.dataframe(df, use_container_width=True, hide_index=True, key=key)
+
+
+# ============================ pages ============================
+def page_dashboard():
+    st.header("Dashboard"); banner()
+
+    @st.fragment(run_every=5)
+    def live():
+        idx = safe_market(get_indices)
+        if not idx:
+            return
+        cols = st.columns(4)
+        for c, i in zip(cols, idx):
+            with c:
+                st.metric(i["name"], f"{i['value']:,.2f}", f"{i['change']:+,.2f} ({i['changePercent']:+.2f}%)")
+                st.caption(f"Prev close {i['prevClose']:,.2f}")
+                f = go.Figure(go.Scatter(y=i["spark"], line=dict(color="#22C55E" if i["change"] >= 0 else "#EF4444", width=2)))
+                f.update_layout(height=70, margin=dict(l=0, r=0, t=0, b=0), xaxis_visible=False, yaxis_visible=False, paper_bgcolor="#0B0F19", plot_bgcolor="#0B0F19")
+                st.plotly_chart(f, use_container_width=True, config={"displayModeBar": False}, key=f"sp{i['name']}{dt.datetime.now().timestamp()}")
+        source_line(idx[0]["asOf"])
+    live()
+
+    qs = safe_market(get_quotes) or []
+    adv, dec = sum(s["change"] > 0 for s in qs), sum(s["change"] < 0 for s in qs)
+    a, b, c, d = st.columns(4)
+    a.metric("Advances", adv); b.metric("Declines", dec); c.metric("Unchanged", len(qs) - adv - dec); d.metric("Market", "Open" if market_open() else "Closed")
+    t1, t2, t3 = st.columns(3)
+    for col, title, rows in [(t1, "Top Gainers", sorted(qs, key=lambda s: -s["changePercent"])[:5]), (t2, "Top Losers", sorted(qs, key=lambda s: s["changePercent"])[:5]),
+                             (t3, "Most Active", sorted(qs, key=lambda s: -s["volume"])[:5])]:
+        with col:
+            st.subheader(title)
+            for s in rows:
+                st.button(f"{s['symbol']}  {inr(s['price'])}  ({pct(s['changePercent'])})", key=f"{title}{s['symbol']}", on_click=open_stock, args=(s["symbol"],), use_container_width=True)
+    st.subheader("Sectors")
+    sec = pd.DataFrame(qs).groupby("sector")["changePercent"].mean().round(2)
+    cols = st.columns(4)
+    for i, (n, v) in enumerate(sec.items()):
+        cols[i % 4].metric(n, pct(v))
+    st.subheader("Recent news")
+    news = get_news()
+    for n in news[:3]:
+        st.markdown(f"**{n['headline']}**  \n<span class='small'>{n['publisher']} · {fmt_time(n['published'])}</span>", unsafe_allow_html=True)
+    if not news:
+        st.info("No news available.")
+
+
+def page_explorer(title="Stock Explorer", sort="Symbol"):
+    st.header(title); banner()
+    qs = safe_market(get_quotes) or []
+    c = st.columns(5)
+    text = c[0].text_input("Search name / ticker")
+    ex = c[1].selectbox("Exchange", ["All", "NSE", "BSE"])
+    sec = c[2].selectbox("Sector", ["All"] + sorted({s["sector"] for s in qs}))
+    cap = c[3].selectbox("Market cap", ["Any", "Large (>₹5L Cr)", "Mid+ (>₹1L Cr)"])
+    srt = c[4].selectbox("Sort by", ["Symbol", "Price", "Change %", "Volume"], index=["Symbol", "Price", "Change %", "Volume"].index(sort))
+    desc = st.checkbox("Descending", value=sort != "Symbol")
+    rows = [s for s in qs if (not text or text.lower() in (s["symbol"] + s["name"]).lower()) and (ex == "All" or s["exchange"] == ex)
+            and (sec == "All" or s["sector"] == sec) and (cap == "Any" or s["marketCap"] >= (500000 if cap.startswith("Large") else 100000))]
+    key = {"Symbol": "symbol", "Price": "price", "Change %": "changePercent", "Volume": "volume"}[srt]
+    rows.sort(key=lambda s: s[key], reverse=desc)
+    if not rows:
+        st.info("No stocks match your filters."); return
+    quote_table(rows, "tbl" + title)
+    syms = [s["symbol"] for s in rows]
+    cur = st.session_state.get("sel")
+    sel = st.selectbox("Open stock details", syms, index=syms.index(cur) if cur in syms else 0, key="sel_box" + title)
+    stock_detail(sel)
+
+
+def stock_detail(sym):
+    s = quote_of(sym)
+    if not s:
+        st.error("Stock not found or data unavailable."); return
+    st.subheader(f"{s['name']} ({s['symbol']})")
+    a, b, c, d = st.columns(4)
+    a.metric("Price", inr(s["price"]), f"{s['change']:+.2f} ({s['changePercent']:+.2f}%)")
+    b.metric("Day high / low", f"{inr(s['high'])} / {inr(s['low'])}"); c.metric("52-week high / low", f"{inr(s['week52High'])} / {inr(s['week52Low'])}")
+    d.metric("Previous close", inr(s["prevClose"]))
+    e, f, g = st.columns(3)
+    e.metric("Exchange / Sector", f"{s['exchange']} · {s['sector']}"); f.metric("Market cap (₹ Cr)", f"{s['marketCap']:,}"); g.metric("Volume", f"{s['volume']:,}")
+    rng = st.radio("Timeframe", list(RANGES), index=3, horizontal=True, key="rng" + sym)
+    df = safe_market(get_history, sym, rng)
+    if df is not None and not df.empty:
+        st.caption(f"Timeframe: {rng} · Data as of {fmt_time(s['asOf'])} · Source: {PROVIDER.name}")
+        st.plotly_chart(stock_chart(df), use_container_width=True)
+    fu = safe_market(PROVIDER.fundamentals, sym)
+    st.markdown("**Fundamentals**")
+    st.dataframe(pd.DataFrame([(k, "Data unavailable" if v is None else v) for k, v in (fu or {}).items()], columns=["Metric", "Value"]) if fu else pd.DataFrame(), hide_index=True)
+    w = q("SELECT id,name FROM watchlists WHERE uid=?", (st.session_state.uid,))
+    if w:
+        pick = st.selectbox("Add to watchlist", [r["name"] for r in w], key="addw" + sym)
+        if st.button("Add", key="addb" + sym):
+            x("INSERT OR IGNORE INTO watch_items VALUES(?,?)", (next(r["id"] for r in w if r["name"] == pick), sym)); st.success("Added to watchlist.")
+
+
+def page_watchlist():
+    st.header("Watchlists"); uid = st.session_state.uid
+    with st.form("newwl", clear_on_submit=True):
+        name = st.text_input("New watchlist name")
+        if st.form_submit_button("Create") and name.strip():
+            x("INSERT INTO watchlists(uid,name) VALUES(?,?)", (uid, name.strip())); st.rerun()
+    lists = q("SELECT * FROM watchlists WHERE uid=?", (uid,))
+    if not lists:
+        st.info("No watchlists yet. Create one above."); return
+    quotes = {s["symbol"]: s for s in get_quotes()}
+    for w in lists:
+        with st.expander(w["name"], expanded=True):
+            items = [r["symbol"] for r in q("SELECT symbol FROM watch_items WHERE wid=?", (w["id"],))]
+            if items:
+                df = pd.DataFrame([{"Symbol": s, "Price (₹)": quotes[s]["price"], "Change %": quotes[s]["changePercent"], "Updated": fmt_time(quotes[s]["asOf"])} for s in items if s in quotes])
+                st.dataframe(df, hide_index=True, use_container_width=True)
+            else:
+                st.caption("Empty list.")
+            c1, c2, c3 = st.columns([2, 1, 1])
+            add = c1.selectbox("Add stock", symbols(), key=f"a{w['id']}")
+            if c2.button("Add", key=f"ab{w['id']}"):
+                x("INSERT OR IGNORE INTO watch_items VALUES(?,?)", (w["id"], add)); st.rerun()
+            if items:
+                rm = c1.selectbox("Remove stock", items, key=f"r{w['id']}")
+                if c2.button("Remove", key=f"rb{w['id']}"):
+                    x("DELETE FROM watch_items WHERE wid=? AND symbol=?", (w["id"], rm)); st.rerun()
+            if c3.button("Delete list", key=f"d{w['id']}"):
+                x("DELETE FROM watch_items WHERE wid=?", (w["id"],)); x("DELETE FROM watchlists WHERE id=?", (w["id"],)); st.rerun()
+
+
+def page_portfolio():
+    st.header("My Portfolio"); banner(); uid = st.session_state.uid
+    with st.form("tx", clear_on_submit=True):
+        c = st.columns(6)
+        sym, ex, typ = c[0].selectbox("Symbol", symbols()), c[1].selectbox("Exchange", ["NSE", "BSE"]), c[2].selectbox("Type", ["BUY", "SELL"])
+        qty, price, day = c[3].number_input("Quantity", 1, 10_000_000, 1), c[4].number_input("Price (₹)", 0.01, 10_000_000.0, 100.0), c[5].date_input("Date", dt.date.today(), max_value=dt.date.today())
+        if st.form_submit_button("Add transaction"):
+            txs = [dict(r) for r in q("SELECT * FROM txs WHERE uid=?", (uid,))] + [dict(symbol=sym, qty=qty, price=price, type=typ, date=day.isoformat())]
             try:
-                with st.spinner(f"Training {model_choice} for {symbol}..."):
-                    df, error = get_valid_stock_data(symbol, "2y")
-                    if error:
-                        show_data_error(error)
-                    else:
-                        X, y, dates, df_ml = prepare_ml_data(df)
-                        model, metrics, X_test, y_test, y_pred = train_and_evaluate_model(X, y, model_choice)
-                        future_prices = predict_future(model, df_ml, days=7)
-
-                if not error:
-                    section_title("Model evaluation", "Metrics below are from the model's out-of-sample test set.")
-                    m1, m2, m3 = st.columns(3)
-                    m1.metric("Mean absolute error", f"{float(metrics['MAE']):,.3f}")
-                    m2.metric("Root mean squared error", f"{float(metrics['RMSE']):,.3f}")
-                    m3.metric("R² score", f"{float(metrics['R2']):.4f}")
-
-                    last_date = pd.to_datetime(df["Date"].iloc[-1])
-                    future_dates = pd.bdate_range(start=last_date + pd.Timedelta(days=1), periods=7)
-                    pred_df = pd.DataFrame({
-                        "Date": future_dates.strftime("%Y-%m-%d"),
-                        "Predicted close price": [round(float(p), 2) for p in future_prices],
-                    })
-
-                    first_prediction = float(future_prices[0])
-                    last_close = float(df["Close"].iloc[-1])
-                    expected_change = ((first_prediction - last_close) / last_close * 100) if last_close else 0
-
-                    section_title("Forecast highlights", "Model-generated estimates; not guaranteed market outcomes.")
-                    p1, p2, p3 = st.columns(3)
-                    p1.metric("Latest historical close", f"{last_close:,.2f}")
-                    p2.metric("Next session estimate", f"{first_prediction:,.2f}", f"{expected_change:+.2f}%")
-                    p3.metric("Forecast horizon", "7 sessions")
-
-                    left, right = st.columns([1.35, 1])
-                    with left:
-                        section_title("Historical vs forecast")
-                        fig = go.Figure()
-                        recent = df.tail(60)
-                        fig.add_trace(go.Scatter(
-                            x=recent["Date"], y=recent["Close"], name="Historical close",
-                            line=dict(color=BLUE, width=2.4),
-                        ))
-                        fig.add_trace(go.Scatter(
-                            x=future_dates, y=future_prices, name="AI forecast",
-                            line=dict(color=GREEN, width=2.5, dash="dash"),
-                            mode="lines+markers",
-                        ))
-                        make_chart_layout(fig, 410, "Price")
-                        st.plotly_chart(fig, use_container_width=True)
-                    with right:
-                        section_title("Seven-session forecast")
-                        st.dataframe(pred_df, use_container_width=True, hide_index=True, height=310)
-
-                    st.session_state.history.append({
-                        "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "Symbol": symbol,
-                        "Model": model_choice,
-                        "Next Session Estimate": round(first_prediction, 2),
-                        "R2 Score": round(float(metrics["R2"]), 4),
-                    })
-                    st.markdown(
-                        '<div class="disclaimer"><b>Important:</b> Predictions are model estimates based on historical patterns. '
-                        'They can be inaccurate and should not be used as financial advice or as the sole basis for investment decisions.</div>',
-                        unsafe_allow_html=True,
-                    )
-            except Exception as exc:
-                st.error(f"The prediction could not be completed: {exc}")
-                st.info("Check that the prediction module, its dependencies and the selected ticker are working correctly.")
-
-
-# ---------------------------------------------------------
-# 4. STOCK COMPARISON
-# ---------------------------------------------------------
-elif menu == "Stock Comparison":
-    page_header(
-        "RELATIVE PERFORMANCE",
-        "Compare stocks side by side.",
-        "Compare normalized percentage movement so stocks with different price levels can be viewed on a common scale.",
-    )
-    symbols_input = st.text_input(
-        "Ticker symbols — separate with commas",
-        value="RELIANCE.NS, TCS.NS, INFY.NS",
-    )
-    symbols_list = list(dict.fromkeys(s.strip().upper() for s in symbols_input.split(",") if s.strip()))
-    period = st.selectbox("Comparison range", ["6mo", "1y", "2y", "5y"], index=1)
-
-    if st.button("Compare selected stocks", type="primary"):
-        if len(symbols_list) < 2:
-            st.warning("Enter at least two stock symbols to compare.")
-        else:
-            with st.spinner("Fetching and comparing stock performance..."):
-                try:
-                    comp_df, norm_df = compare_stocks(symbols_list, period=period)
-                    if comp_df is None or comp_df.empty or norm_df is None or norm_df.empty:
-                        st.error("No comparison data was returned. Check the symbols and try again.")
-                    else:
-                        section_title("Normalized return", "Each series is rebased to 0% at the beginning of the selected period.")
-                        fig = go.Figure()
-                        for column in norm_df.columns:
-                            fig.add_trace(go.Scatter(
-                                x=norm_df.index, y=norm_df[column],
-                                name=str(column), mode="lines",
-                            ))
-                        make_chart_layout(fig, 460, "Return (%)")
-                        fig.add_hline(y=0, line_dash="dot", line_color="#64748B")
-                        st.plotly_chart(fig, use_container_width=True)
-                except Exception as exc:
-                    st.error(f"Comparison failed: {exc}")
-
-
-# ---------------------------------------------------------
-# 5. MARKET WATCHLIST
-# ---------------------------------------------------------
-elif menu == "Market Watchlist":
-    page_header(
-        "MARKET MONITOR",
-        "Your watchlist, at a glance.",
-        "A quick view of selected Indian and US stocks using the same market-data connection as the rest of the application.",
-    )
-    watchlist_symbols = ["RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "AAPL", "MSFT", "NVDA"]
+                compute_holdings(txs)
+                x("INSERT INTO txs(uid,symbol,exchange,qty,price,type,date) VALUES(?,?,?,?,?,?,?)", (uid, sym, ex, qty, price, typ, day.isoformat())); st.success("Transaction recorded.")
+            except ValueError as e:
+                st.error(str(e))
+    txs = [dict(r) for r in q("SELECT * FROM txs WHERE uid=?", (uid,))]
+    hold = compute_holdings(txs)
+    qs = {s["symbol"]: s for s in get_quotes()}
     rows = []
-
-    with st.spinner("Loading watchlist quotes..."):
-        for ticker in watchlist_symbols:
-            try:
-                info, error = get_stock_info(ticker)
-                if not error and info:
-                    rows.append({
-                        "Symbol": info.get("symbol", ticker),
-                        "Company": info.get("shortName", ticker),
-                        "Last price": round(float(info.get("current_price", 0)), 2),
-                        "Change": round(float(info.get("change", 0)), 2),
-                        "Change %": round(float(info.get("pct_change", 0)), 2),
-                        "Currency": info.get("currency", ""),
-                    })
-            except Exception:
-                continue
-
-    if rows:
-        watch_df = pd.DataFrame(rows)
-        section_title("Tracked instruments", f"{len(rows)} of {len(watchlist_symbols)} symbols returned data.")
-        st.dataframe(
-            watch_df,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Last price": st.column_config.NumberColumn(format="%.2f"),
-                "Change": st.column_config.NumberColumn(format="%.2f"),
-                "Change %": st.column_config.NumberColumn(format="%.2f%%"),
-            },
-        )
-    else:
-        st.error("The data provider did not return watchlist quotes. Please try again later.")
-
-
-# ---------------------------------------------------------
-# 6. PREDICTION HISTORY
-# ---------------------------------------------------------
-elif menu == "Prediction History":
-    page_header(
-        "YOUR MODEL RUNS",
-        "Prediction history.",
-        "Review predictions generated during this active Streamlit session. This history resets when the session is cleared.",
-    )
-    if not st.session_state.history:
-        st.info("No predictions have been generated in this session yet. Open AI Stock Prediction to run your first model.")
-    else:
-        hist_df = pd.DataFrame(st.session_state.history)
-        section_title("Recent model runs", f"{len(hist_df)} prediction run(s)")
-        st.dataframe(hist_df, use_container_width=True, hide_index=True)
-        csv_data = hist_df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "⬇  Download history as CSV",
-            data=csv_data,
-            file_name="equityai_prediction_history.csv",
-            mime="text/csv",
-        )
-        if st.button("Clear session history"):
-            st.session_state.history = []
-            st.rerun()
-
-
-# ---------------------------------------------------------
-# 7. ABOUT PROJECT
-# ---------------------------------------------------------
-elif menu == "About Project":
-    page_header(
-        "ABOUT EQUITYAI",
-        "Making market data easier to explore.",
-        "An educational stock analytics and machine-learning project built with Python and Streamlit.",
-    )
-    st.markdown("### What this application does")
+    for h in hold:
+        if h["qty"] > 0:
+            s = qs.get(h["symbol"]); val = s["price"] * h["qty"] if s else None
+            rows.append(dict(Symbol=h["symbol"], Sector=s["sector"] if s else "Unknown", Qty=h["qty"], AvgCost=round(h["avg"], 2), LTP=s["price"] if s else None,
+                             Invested=h["qty"] * h["avg"], Value=val if val is not None else h["qty"] * h["avg"], Unrealized=(val - h["qty"] * h["avg"]) if val is not None else None))
+    realized = sum(h["realized"] for h in hold)
+    inv, val = sum(r["Invested"] for r in rows), sum(r["Value"] for r in rows)
+    c = st.columns(5)
+    c[0].metric("Invested", inr(inv)); c[1].metric("Current value", inr(val)); c[2].metric("Realized P/L", inr(realized))
+    c[3].metric("Unrealized P/L", inr(val - inv)); c[4].metric("Overall return", pct((val - inv + realized) / inv * 100 if inv else 0))
+    st.caption("Cost basis: weighted average cost. Brokerage, taxes and corporate actions are not applied automatically.")
+    if not rows:
+        st.info("No holdings yet. Add your first transaction above."); return
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
     a, b = st.columns(2)
-    with a:
-        st.markdown(
-            """
-            **Market data**
-            - Retrieves historical OHLCV stock data through the existing data module.
-            - Displays price history and selected market metrics.
-            - Supports ticker symbols such as `RELIANCE.NS`, `TCS.NS` and `AAPL`.
-
-            **Technical analysis**
-            - Simple Moving Averages (SMA)
-            - Relative Strength Index (RSI)
-            - Moving Average Convergence Divergence (MACD)
-            """
-        )
-    with b:
-        st.markdown(
-            """
-            **Machine learning**
-            - Random Forest Regressor
-            - Linear Regression
-            - Out-of-sample evaluation using MAE, RMSE and R²
-            - Seven-session model forecast
-
-            **Technology**
-            - Python and Streamlit
-            - Pandas for data handling
-            - Plotly for interactive charts
-            - Existing project modules for data, indicators and predictions
-            """
-        )
-    st.markdown("---")
-    st.markdown("### Important limitations")
-    st.warning(
-        "Stock prices are volatile and influenced by many factors that are not represented in historical-price models. "
-        "Predictions are estimates for learning and demonstration only, not financial advice."
-    )
+    a.plotly_chart(bar_alloc([r["Symbol"] for r in rows], [r["Invested"] for r in rows], "Investment allocation"), use_container_width=True)
+    sec = pd.DataFrame(rows).groupby("Sector")["Value"].sum()
+    b.plotly_chart(bar_alloc(list(sec.index), list(sec.values), "Sector allocation"), use_container_width=True)
+    pl = go.Figure(go.Bar(x=[r["Symbol"] for r in rows], y=[r["Unrealized"] or 0 for r in rows], marker_color=["#22C55E" if (r["Unrealized"] or 0) >= 0 else "#EF4444" for r in rows]))
+    pl.update_layout(title="Profit/loss distribution", height=300, template="plotly_dark", paper_bgcolor="#151D2B")
+    st.plotly_chart(pl, use_container_width=True)
+    curve, run = [], []
+    for t in sorted(txs, key=lambda t: t["date"]):
+        run.append(t); curve.append((t["date"], sum(h["qty"] * h["avg"] for h in compute_holdings(run))))
+    if len(curve) > 1:
+        st.plotly_chart(go.Figure(go.Scatter(x=[c[0] for c in curve], y=[c[1] for c in curve], mode="lines+markers")).update_layout(title="Invested capital over time", height=300, template="plotly_dark", paper_bgcolor="#151D2B"), use_container_width=True)
 
 
-# ---------------------------------------------------------
-# FOOTER
-# ---------------------------------------------------------
-st.markdown("---")
-st.markdown(
-    """
-    <div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;color:#718096;font-size:11px;">
-      <span>© EquityAI · AI Stock Intelligence Dashboard</span>
-      <span>Educational use only · Market data may be delayed</span>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+def page_ai():
+    st.header("AI Stock Analyst"); banner()
+    sym = st.selectbox("Company", symbols())
+    if st.button("Analyse", type="primary"):
+        try:
+            with st.spinner("Analysing with Gemini..."):
+                facts = verified_facts(sym)
+                text = gemini("Analyse this company with sections: Company Overview, Fundamental Analysis, Technical Analysis, Risk Analysis, AI Summary "
+                              f"(positives, negatives, bullish scenario, bearish scenario, risks to monitor). DATA:\n{json.dumps(facts)}")
+            x("INSERT INTO aireports(uid,symbol,analysis,ts) VALUES(?,?,?,?)", (st.session_state.uid, sym, text, now_iso()))
+            st.session_state.report = dict(symbol=sym, facts=facts, text=text, ts=now_iso()); st.session_state.chat = []
+        except Exception as e:
+            st.error(str(e))
+    r = st.session_state.get("report")
+    if r:
+        with st.expander("Verified data (FACTS)", expanded=False):
+            st.caption(f"Source: {r['facts']['dataSource']}{' (DEMO fictional data)' if r['facts']['demoData'] else ''} · as of {fmt_time(r['facts']['quote']['asOf'])}")
+            st.json({k: r["facts"][k] for k in ("quote", "fundamentals", "technical")})
+        st.markdown(f"**AI-GENERATED INTERPRETATION** · {fmt_time(r['ts'])}"); st.write(r["text"])
+        st.subheader(f"Ask about {r['symbol']}")
+        for role, t in st.session_state.get("chat", []):
+            st.chat_message("user" if role == "user" else "assistant").write(t)
+        if msg := st.chat_input("e.g. What are the main risks?"):
+            try:
+                ans = gemini(f"DATA:\n{json.dumps(verified_facts(r['symbol']))}\n\nQUESTION: {msg}", st.session_state.get("chat", [])[-20:])
+                st.session_state.chat = st.session_state.get("chat", []) + [("user", msg), ("model", ans)]; st.rerun()
+            except Exception as e:
+                st.error(str(e))
+    st.caption("Educational use only. Not investment advice. AI can make mistakes; verify with official filings.")
+
+
+def vholdings(uid):
+    trades = [dict(symbol=t["symbol"], qty=t["qty"], price=t["price"], type=t["type"], date=t["ts"]) for t in q("SELECT * FROM vtrades WHERE uid=?", (uid,))]
+    return [h for h in compute_holdings(trades) if h["qty"] > 0]
+
+
+def equity(uid, bal, qs):
+    return bal + sum(h["qty"] * (qs[h["symbol"]]["price"] if h["symbol"] in qs else h["avg"]) for h in vholdings(uid))
+
+
+def page_virtual():
+    st.header("Virtual Trading (Simulated)"); banner(); uid = st.session_state.uid
+    st.warning("Paper trading only. No real money, no brokerage connection. Every transaction is simulated.")
+    qs = {s["symbol"]: s for s in get_quotes()}
+    bal = q("SELECT balance FROM vacct WHERE uid=?", (uid,), one=True)["balance"]
+    eq = equity(uid, bal, qs)
+    a, b, c, d = st.columns(4)
+    a.metric("Virtual balance", inr(bal)); b.metric("Total equity", inr(eq)); c.metric("P/L", inr(eq - START_BALANCE)); d.metric("Return", pct((eq - START_BALANCE) / START_BALANCE * 100))
+    with st.form("order"):
+        c = st.columns(4)
+        sym, typ, qty = c[0].selectbox("Symbol", symbols()), c[1].selectbox("Side", ["BUY", "SELL"]), c[2].number_input("Quantity", 1, 100000, 1)
+        c[3].metric("Estimated value", inr(qs[sym]["price"] * qty) if sym in qs else "—")
+        if st.form_submit_button("Confirm simulated order"):
+            price = qs[sym]["price"]; cost = price * qty  # price is taken server-side, never from user input
+            held = next((h["qty"] for h in vholdings(uid) if h["symbol"] == sym), 0)
+            if typ == "BUY" and cost > bal:
+                st.error("Insufficient virtual balance.")
+            elif typ == "SELL" and qty > held:
+                st.error("Insufficient shares to sell.")
+            else:
+                x("UPDATE vacct SET balance=balance+? WHERE uid=?", (-cost if typ == "BUY" else cost, uid))
+                x("INSERT INTO vtrades(uid,symbol,qty,price,type,ts) VALUES(?,?,?,?,?,?)", (uid, sym, qty, price, typ, now_iso()))
+                st.success(f"Simulated {typ} of {qty} {sym} at {inr(price)} executed."); st.rerun()
+    l, r = st.columns(2)
+    with l:
+        st.subheader("Holdings")
+        hs = vholdings(uid)
+        st.dataframe(pd.DataFrame([dict(Symbol=h["symbol"], Qty=h["qty"], AvgCost=round(h["avg"], 2), LTP=qs.get(h["symbol"], {}).get("price"),
+                                        PL=round((qs[h["symbol"]]["price"] - h["avg"]) * h["qty"], 2) if h["symbol"] in qs else None) for h in hs]), hide_index=True) if hs else st.caption("No holdings.")
+    with r:
+        st.subheader("Leaderboard")
+        board = sorted([(u["name"], (equity(u["id"], u["balance"], qs) - START_BALANCE) / START_BALANCE * 100)
+                        for u in q("SELECT users.id,users.name,vacct.balance FROM users JOIN vacct ON vacct.uid=users.id")], key=lambda t: -t[1])[:20]
+        st.dataframe(pd.DataFrame([(i + 1, n, pct(v)) for i, (n, v) in enumerate(board)], columns=["#", "Trader", "Return"]), hide_index=True)
+    st.subheader("Transaction history")
+    hist = q("SELECT symbol,type,qty,price,ts FROM vtrades WHERE uid=? ORDER BY id DESC LIMIT 100", (uid,))
+    st.dataframe(pd.DataFrame([dict(Time=fmt_time(h["ts"]), Side=h["type"], Symbol=h["symbol"], Qty=h["qty"], Price=h["price"], Note="SIMULATED") for h in hist]), hide_index=True) if hist else st.caption("No trades yet.")
+
+
+def page_news():
+    st.header("Market News"); banner()
+    cat = st.radio("Category", ["All", "Indian stock market", "Company news", "Banking", "Technology", "Economy", "IPO", "Global markets"], horizontal=True)
+    items = [n for n in get_news() if cat == "All" or n["category"] == cat]
+    if not items:
+        st.info("No news available for this category.")
+    for n in items:
+        with st.container(border=True):
+            st.markdown(f"**{n['headline']}**"); st.write(n["summary"])
+            st.caption(f"{n['publisher']} · {fmt_time(n['published'])}" + (f" · [Original article]({n['url']})" if n["url"] else ""))
+    st.caption("Add a licensed news provider in get_news(); AI summaries/sentiment can then pass headlines to gemini().")
+
+
+def page_ipo():
+    st.header("IPO Center"); banner()
+    df = get_ipos()
+    if df.empty:
+        st.info("No IPO data available."); return
+    for status in ["Open", "Upcoming", "Listed", "Closed"]:
+        sub = df[df["Status"] == status]
+        if len(sub):
+            st.subheader(status); st.dataframe(sub.drop(columns="Status"), hide_index=True, use_container_width=True)
+    source_line(now_iso())
+
+
+def page_alerts():
+    st.header("Alerts"); uid = st.session_state.uid
+    with st.form("al", clear_on_submit=True):
+        c = st.columns(4)
+        sym, cond = c[0].selectbox("Symbol", symbols()), c[1].selectbox("Condition", ["Price above", "Price below", "% increase (day)", "% decrease (day)"])
+        tgt = c[2].number_input("Target (₹ or %)", 0.01, 10_000_000.0, 100.0)
+        if c[3].form_submit_button("Create alert"):
+            x("INSERT INTO alerts(uid,symbol,cond,target) VALUES(?,?,?,?)", (uid, sym, cond, tgt)); st.rerun()
+    st.subheader("Your alerts")
+    al = q("SELECT * FROM alerts WHERE uid=? ORDER BY id DESC", (uid,))
+    if not al:
+        st.info("No alerts.")
+    for a in al:
+        c = st.columns([4, 1, 1])
+        c[0].write(f"{a['symbol']} · {a['cond']} {a['target']} — {'🟢 Active' if a['active'] else '✅ Triggered ' + fmt_time(a['triggered'])}")
+        if c[2].button("Delete", key=f"da{a['id']}"):
+            x("DELETE FROM alerts WHERE id=? AND uid=?", (a["id"], uid)); st.rerun()
+    st.subheader("Notifications")
+    for n in q("SELECT * FROM notifs WHERE uid=? ORDER BY id DESC LIMIT 30", (uid,)):
+        st.write(f"🔔 {n['msg']}  ·  _{fmt_time(n['ts'])}_")
+    st.caption("Alerts are evaluated whenever the app refreshes (page interaction or Dashboard auto-refresh).")
+
+
+def page_settings():
+    st.header("Settings"); uid = st.session_state.uid
+    u = q("SELECT * FROM users WHERE id=?", (uid,), one=True)
+    with st.form("prof"):
+        name = st.text_input("Name", u["name"]); st.caption(u["email"])
+        ex = st.selectbox("Default exchange", ["NSE", "BSE"], index=["NSE", "BSE"].index(u["exchange"]))
+        if st.form_submit_button("Save profile") and name.strip():
+            x("UPDATE users SET name=?, exchange=? WHERE id=?", (name.strip(), ex, uid)); st.success("Profile updated.")
+    with st.form("pw", clear_on_submit=True):
+        cur, new = st.text_input("Current password", type="password"), st.text_input("New password (min 8)", type="password")
+        if st.form_submit_button("Change password"):
+            if check_pw(cur, u["pw"]) and len(new) >= 8:
+                x("UPDATE users SET pw=? WHERE id=?", (hash_pw(new), uid)); st.success("Password changed.")
+            else:
+                st.error("Current password incorrect or new password too short.")
+
+
+# ============================ app shell ============================
+def auth_screen():
+    st.title("📈 StockPulse AI"); st.caption("Understand Markets. Invest Smarter.")
+    t1, t2 = st.tabs(["Log in", "Register"])
+    with t1, st.form("li"):
+        e, p = st.text_input("Email"), st.text_input("Password", type="password")
+        if st.form_submit_button("Log in"):
+            uid, err = login(e, p)
+            if err: st.error(err)
+            else: st.session_state.uid = uid; st.rerun()
+    with t2, st.form("rg"):
+        n, e, p = st.text_input("Name"), st.text_input("Email "), st.text_input("Password (min 8 chars)", type="password")
+        if st.form_submit_button("Create account"):
+            uid, err = register(n, e, p)
+            if err: st.error(err)
+            else: st.session_state.uid = uid; st.rerun()
+
+
+PAGES = ["Dashboard", "Markets", "Stock Explorer", "Watchlist", "My Portfolio", "AI Stock Analyst", "Virtual Trading", "Market News", "IPO Center", "Alerts", "Settings"]
+
+
+def main():
+    if "uid" not in st.session_state:
+        auth_screen(); return
+    uid = st.session_state.uid
+    user = q("SELECT * FROM users WHERE id=?", (uid,), one=True)
+    if not user:
+        st.session_state.clear(); st.rerun()
+    evaluate_alerts(uid)
+    with st.sidebar:
+        st.markdown("## Stock**Pulse** AI")
+        st.selectbox("Global stock search", [""] + symbols(), key="gs", format_func=lambda s: s or "Search company / symbol…", on_change=lambda: open_stock(st.session_state.gs) if st.session_state.gs else None)
+        st.selectbox("Exchange", ["NSE", "BSE"], index=["NSE", "BSE"].index(user["exchange"]), key="ex_sel")
+        st.markdown("🟢 **Market open**" if market_open() else "🔴 **Market closed**")
+        st.radio("Navigate", PAGES, key="page", label_visibility="collapsed")
+        st.caption(f"Signed in as {user['name']}")
+        if st.button("Log out"):
+            st.session_state.clear(); st.rerun()
+    {"Dashboard": page_dashboard, "Markets": lambda: page_explorer("Markets", "Change %"), "Stock Explorer": page_explorer, "Watchlist": page_watchlist,
+     "My Portfolio": page_portfolio, "AI Stock Analyst": page_ai, "Virtual Trading": page_virtual, "Market News": page_news, "IPO Center": page_ipo,
+     "Alerts": page_alerts, "Settings": page_settings}[st.session_state.get("page", "Dashboard")]()
+    st.divider(); st.caption("Educational use only. Not investment advice. Market data may be delayed or unavailable.")
+
+
+main()

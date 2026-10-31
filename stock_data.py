@@ -1,6 +1,60 @@
 import pandas as pd
 import yfinance as yf
 
+# Pre-populated Categorized Stock Directory for Indian and US Markets
+STOCK_CATEGORIES = {
+    "Indian IT": {
+        "TCS (Tata Consultancy Services)": "TCS.NS",
+        "Infosys": "INFY.NS",
+        "Wipro": "WIPRO.NS",
+        "HCL Technologies": "HCLTECH.NS",
+        "Tech Mahindra": "TECHM.NS"
+    },
+    "Indian Banking & Finance": {
+        "HDFC Bank": "HDFCBANK.NS",
+        "ICICI Bank": "ICICIBANK.NS",
+        "State Bank of India (SBI)": "SBIN.NS",
+        "Axis Bank": "AXISBANK.NS",
+        "Kotak Mahindra Bank": "KOTAKBANK.NS"
+    },
+    "Indian Energy & Auto": {
+        "Reliance Industries": "RELIANCE.NS",
+        "Tata Motors": "TATAMOTORS.NS",
+        "NTPC Limited": "NTPC.NS",
+        "Power Grid Corporation": "POWERGRID.NS",
+        "ONGC": "ONGC.NS"
+    },
+    "Indian FMCG": {
+        "Hindustan Unilever": "HINDUNILVR.NS",
+        "ITC Limited": "ITC.NS",
+        "Nestlé India": "NESTLEIND.NS",
+        "Britannia Industries": "BRITANNIA.NS"
+    },
+    "US Big Tech": {
+        "Apple": "AAPL",
+        "Microsoft": "MSFT",
+        "Alphabet (Google)": "GOOGL",
+        "Amazon": "AMZN",
+        "Meta Platforms": "META",
+        "NVIDIA": "NVDA",
+        "Netflix": "NFLX"
+    },
+    "US EV & Finance": {
+        "Tesla": "TSLA",
+        "JPMorgan Chase": "JPM",
+        "Visa": "V",
+        "Mastercard": "MA",
+        "Bank of America": "BAC"
+    }
+}
+
+def get_stock_categories():
+    """
+    Returns the dictionary of categorized stock symbols for UI dropdowns.
+    """
+    return STOCK_CATEGORIES
+
+
 def fetch_stock_data(symbol, period="1y"):
     """
     Fetches historical stock data using yfinance.
@@ -24,9 +78,10 @@ def fetch_stock_data(symbol, period="1y"):
     except Exception as e:
         return None, str(e)
 
+
 def get_stock_info(symbol):
     """
-    Fetches latest quote and company info.
+    Fetches latest quote and company info with robust fallbacks.
     """
     try:
         ticker = yf.Ticker(symbol.strip().upper())

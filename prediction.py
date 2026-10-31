@@ -58,7 +58,8 @@ def predict_future(model, df_ml, days=7):
     last_row = df_ml.iloc[-1].copy()
     
     predictions = []
-    current_features = last_row[features].values.reshape(1, -1)
+    # Explicitly cast to float array to prevent assignment errors
+    current_features = last_row[features].values.astype(float).reshape(1, -1)
     last_close = last_row['Close']
     
     for i in range(days):
@@ -68,7 +69,7 @@ def predict_future(model, df_ml, days=7):
         daily_ret = (pred_price - last_close) / last_close if last_close != 0 else 0
         last_close = pred_price
         
-        current_features[0, 0] = pred_price
-        current_features[0, 6] = daily_ret
+        current_features[0, 0] = float(pred_price)
+        current_features[0, 6] = float(daily_ret)
         
     return predictions
